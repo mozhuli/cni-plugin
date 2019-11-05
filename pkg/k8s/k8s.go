@@ -519,9 +519,7 @@ func releaseIPAddrs(ipAddrs []string, calico calicoclient.Interface, logger *log
 func ipAddrsResult(ipAddrs string, conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*current.Result, error) {
 	logger.Infof("Parsing annotation \"cni.projectcalico.org/ipAddrs\":%s", ipAddrs)
 
-	// We need to make sure there is only one IPv4 and/or one IPv6
-	// passed in, since CNI spec only supports one of each right now.
-	ipList, err := validateAndExtractIPs(ipAddrs, "cni.projectcalico.org/ipAddrs", logger)
+	ipv4List, ipv6List, err := validateAndExtractIPsForIpAddrs(ipAddrs, "cni.projectcalico.org/ipAddrs", logger)
 	if err != nil {
 		return nil, err
 	}
@@ -531,15 +529,30 @@ func ipAddrsResult(ipAddrs string, conf types.NetConf, args *skel.CmdArgs, logge
 	// Go through all the IPs passed in as annotation value and call IPAM plugin
 	// for each, and populate the result variable with IP4 and/or IP6 IPs returned
 	// from the IPAM plugin.
-	for _, ip := range ipList {
+	for _, ip := range ipv4List {
 		// Call callIPAMWithIP with the ip address.
 		r, err := callIPAMWithIP(ip, conf, args, logger)
 		if err != nil {
-			return nil, fmt.Errorf("error getting IP from IPAM: %s", err)
+			logger.Infof("error getting IPv4 %s from IPAM: %s. try next...", ip.String(), err)
+			continue
 		}
 
 		result.IPs = append(result.IPs, r.IPs[0])
 		logger.Debugf("Adding IPv%s: %s to result", r.IPs[0].Version, ip.String())
+		break
+	}
+
+	for _, ip := range ipv6List {
+		// Call callIPAMWithIP with the ip address.
+		r, err := callIPAMWithIP(ip, conf, args, logger)
+		if err != nil {
+			logger.Infof("error getting IPv6 %s from IPAM: %s. try next...", ip.String(), err)
+			continue
+		}
+
+		result.IPs = append(result.IPs, r.IPs[0])
+		logger.Debugf("Adding IPv%s: %s to result", r.IPs[0].Version, ip.String())
+		break
 	}
 
 	return &result, nil
@@ -624,7 +637,7 @@ func overrideIPAMResult(ipAddrsNoIpam string, logger *logrus.Entry) (*current.Re
 
 	// We need to make sure there is only one IPv4 and/or one IPv6
 	// passed in, since CNI spec only supports one of each right now.
-	ipList, err := validateAndExtractIPs(ipAddrsNoIpam, "cni.projectcalico.org/ipAddrsNoIpam", logger)
+	ipList, err := validateAndExtractIPsForIpAddrsNoIpam(ipAddrsNoIpam, "cni.projectcalico.org/ipAddrsNoIpam", logger)
 	if err != nil {
 		return nil, err
 	}
@@ -660,9 +673,9 @@ func overrideIPAMResult(ipAddrsNoIpam string, logger *logrus.Entry) (*current.Re
 	return &result, nil
 }
 
-// validateAndExtractIPs is a utility function that validates the passed IP list to make sure
+// validateAndExtractIPsForIpAddrsNoIpam is a utility function that validates the passed IP list to make sure
 // there is one IPv4 and/or one IPv6 and then returns the slice of IPs.
-func validateAndExtractIPs(ipAddrs string, annotation string, logger *logrus.Entry) ([]net.IP, error) {
+func validateAndExtractIPsForIpAddrsNoIpam(ipAddrs string, annotation string, logger *logrus.Entry) ([]net.IP, error) {
 	// Parse IPs from JSON.
 	ips, err := parseIPAddrs(ipAddrs, logger)
 	if err != nil {
@@ -705,6 +718,44 @@ func validateAndExtractIPs(ipAddrs string, annotation string, logger *logrus.Ent
 	}
 
 	return ipList, nil
+}
+
+// validateAndExtractIPsForIpAddrs is a utility function that validates the passed IP list to make sure
+// IPv4 and IPv6 have equal numbers, and then returns the slice of IPv4s and IPv6s.
+func validateAndExtractIPsForIpAddrs(ipAddrs string, annotation string, logger *logrus.Entry) ([]net.IP, []net.IP, error) {
+	// Parse IPs from JSON.
+	ips, err := parseIPAddrs(ipAddrs, logger)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse IPs %s for annotation \"%s\": %s", ipAddrs, annotation, err)
+	}
+
+	// annotation value can't be empty.
+	if len(ips) == 0 {
+		return nil, nil, fmt.Errorf("annotation \"%s\" specified but empty", annotation)
+	}
+
+	var ipv4List, ipv6List []net.IP
+
+	for _, ip := range ips {
+		ipAddr := net.ParseIP(ip)
+		if ipAddr == nil {
+			logger.WithField("IP", ip).Error("Invalid IP format")
+			return nil, nil, fmt.Errorf("invalid IP format: %s", ip)
+		}
+
+		if ipAddr.To4() != nil {
+			ipv4List = append(ipv4List, ipAddr)
+		} else {
+			ipv6List = append(ipv6List, ipAddr)
+		}
+	}
+
+	// We need to make sure if IPv4 and IPv6 not null, they must have equal numbers.
+	if len(ipv4List) != 0 && len(ipv6List) != 0 && len(ipv4List) != len(ipv6List) {
+		return nil, nil, fmt.Errorf("IPs %s for annotation \"%s\" with not equal number of ipv4 and ipv6 when both are not null", ipAddrs, annotation)
+	}
+
+	return ipv4List, ipv6List, nil
 }
 
 // parseIPAddrs is a utility function that parses string of IPs in json format that are
